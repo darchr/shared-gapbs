@@ -110,14 +110,15 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
       // make sure to drop ROIs for everything except TC!
       if (!cli.is_tc()) {
         map_m5_mem();
-        m5_work_begin(0,0);
+        // We need checkpoints for space-control
+        m5_exit(0);
         std::cout<<"---------------------roi begin--------------------" << '\n';
       }
     #endif
     auto result = kernel(g);
       #ifdef HOOKS
       std::cout<<"---------------------roi end--------------------" << '\n';
-      m5_work_end(0,0);
+      m5_exit(0);
     #endif
     trial_timer.Stop();
     PrintTime("Trial Time", trial_timer.Seconds());

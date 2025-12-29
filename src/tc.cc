@@ -49,7 +49,7 @@ using namespace std;
 size_t OrderedCount(const Graph &g) {
 #ifdef HOOKS
 map_m5_mem();
-m5_work_begin(0,0);
+m5_exit(0);
 std::cout<<"---------------------roi begin--------------------" << '\n';
 #endif
   size_t total = 0;
