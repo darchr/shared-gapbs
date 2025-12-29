@@ -35,7 +35,7 @@ class CLBase {
   std::string name_;
 
   // kg: added a field `x` to specify node/host id.
-  std::string get_args_ = "x:l:S:T:f:g:hk:su:m";
+  std::string get_args_ = "Z:x:l:S:T:f:g:hk:su:m";
   std::vector<std::string> help_strings_;
 
   // kg: kg added a new field to specify the host id.
@@ -43,6 +43,8 @@ class CLBase {
   int munmap_ = 0;
   int size_in_gib = 0;
   int test_mode = 0;
+
+  int tc_running = 0;
 
   int scale_ = -1;
   int degree_ = 16;
@@ -73,6 +75,9 @@ class CLBase {
     AddHelpLine('T', "int", "enable test mode /dev/shmem is mounted [0]/1");
     AddHelpLine('l', "int", "if you want to zero out the memory [0]/1");
     AddHelpLine('x', "int", "specify the host id. 0 -> master");
+    // kg: To make TC's ROI faster, create another option to indicate that the
+    // user is running TC
+    AddHelpLine('Z', "int", "let the program know that you're running TC [0]/1");
     AddHelpLine('h', "", "print this help message");
     AddHelpLine('f', "file", "load graph from file");
     AddHelpLine('s', "", "symmetrize input edge list", "false");
@@ -105,6 +110,7 @@ class CLBase {
       case 'l': munmap_ = atoi(opt_arg);                    break;
       case 'S': size_in_gib = atoi(opt_arg);                break;
       case 'T': test_mode = atoi(opt_arg);                  break;
+      case 'Z': tc_running = atoi(opt_arg);                 break;
       // kg: business as usual.
       case 'f': filename_ = std::string(opt_arg);           break;
       case 'g': scale_ = atoi(opt_arg);                     break;
@@ -129,6 +135,7 @@ class CLBase {
   int munmap_me() const { return munmap_; }
   int get_size() const { return size_in_gib; }
   int is_test() const { return test_mode; }
+  int is_tc() const { return tc_running; }
   int scale() const { return scale_; }
   int degree() const { return degree_; }
   std::string filename() const { return filename_; }

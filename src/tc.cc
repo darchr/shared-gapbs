@@ -12,6 +12,8 @@
 #include "graph.h"
 #include "pvector.h"
 
+#include "m5ops.h"
+#include "m5_mmap.h"
 
 /*
 GAP Benchmark Suite
@@ -45,6 +47,11 @@ to relabel the graph, we use the heuristic in WorthRelabelling.
 using namespace std;
 
 size_t OrderedCount(const Graph &g) {
+#ifdef HOOKS
+map_m5_mem();
+m5_work_begin(0,0);
+std::cout<<"---------------------roi begin--------------------" << '\n';
+#endif
   size_t total = 0;
   #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
   for (NodeID u=0; u < g.num_nodes(); u++) {
@@ -86,6 +93,7 @@ bool WorthRelabelling(const Graph &g) {
 }
 
 
+// make sure that the user is running TC
 // uses heuristic to see if worth relabeling
 size_t Hybrid(const Graph &g) {
   if (WorthRelabelling(g))
@@ -140,6 +148,8 @@ int main(int argc, char* argv[]) {
     cout << "Input graph is directed but tc requires undirected" << endl;
     return -2;
   }
+  // make sure that the user is running TC
+  assert(cli.is_tc());
   BenchmarkKernel(cli, g, Hybrid, PrintTriangleStats, TCVerifier);
   return 0;
 }
