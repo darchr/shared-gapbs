@@ -552,7 +552,7 @@ class BuilderBase {
     pvector<SGOffset> offsets = ParallelPrefixSum(degrees);
     DestID_* neighs = new DestID_[offsets[g.num_nodes()]];
     DestID_** index = CSRGraph<NodeID_, DestID_>::GenIndex(offsets, neighs);
-    // #pragma omp parallel for
+    #pragma omp parallel for
     for (NodeID_ u=0; u < g.num_nodes(); u++) {
       for (NodeID_ v : g.out_neigh(u)) {
         // kg: wants to debug this
