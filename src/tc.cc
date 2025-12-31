@@ -47,11 +47,6 @@ to relabel the graph, we use the heuristic in WorthRelabelling.
 using namespace std;
 
 size_t OrderedCount(const Graph &g) {
-#ifdef HOOKS
-map_m5_mem();
-m5_exit(0);
-std::cout<<"---------------------roi begin--------------------" << '\n';
-#endif
   size_t total = 0;
   #pragma omp parallel for reduction(+ : total) schedule(dynamic, 64)
   for (NodeID u=0; u < g.num_nodes(); u++) {
@@ -149,7 +144,6 @@ int main(int argc, char* argv[]) {
     return -2;
   }
   // make sure that the user is running TC
-  assert(cli.is_tc());
   BenchmarkKernel(cli, g, Hybrid, PrintTriangleStats, TCVerifier);
   return 0;
 }

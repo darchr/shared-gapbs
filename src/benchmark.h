@@ -107,13 +107,10 @@ void BenchmarkKernel(const CLApp &cli, const GraphT_ &g,
   for (int iter=0; iter < cli.num_trials(); iter++) {
     trial_timer.Start();
     #ifdef HOOKS
-      // make sure to drop ROIs for everything except TC!
-      if (!cli.is_tc()) {
-        map_m5_mem();
-        // We need checkpoints for space-control
-        m5_exit(0);
-        std::cout<<"---------------------roi begin--------------------" << '\n';
-      }
+      map_m5_mem();
+      // We need checkpoints for space-control
+      m5_exit(0);
+      std::cout<<"---------------------roi begin--------------------" << '\n';
     #endif
     auto result = kernel(g);
       #ifdef HOOKS
