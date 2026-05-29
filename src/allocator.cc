@@ -8,7 +8,7 @@
 
 #include "benchmark.h"
 #include "command_line.h"
-#include "dmalloc.h"
+#include "graph_shmem.h"
 
 int main(int argc, char* argv[]) {
   CLApp cli(argc, argv, "allocator");
@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
   // we don't overwrite the graph or munmap it unless the user specifies.
   if (cli.munmap_me() == 1) {
       std::cout << "info: zeroing out the memory" << std::endl;
-      munmap_memory(cli.get_size(), cli.is_test(), cli.host_id());
+      graph_shmem_reset_region((size_t) cli.get_size(), cli.is_test());
   }
   
   Graph g = b.MakeGraph(cli.host_id());

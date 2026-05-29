@@ -43,8 +43,18 @@ ifeq (${HOOKS}, 1)
        CXX_FLAGS += -DHOOKS
 endif
 
-% : src/%.cc src/*.h $(OBJS)
-	$(CXX) $(CXX_FLAGS) $< -o $@ ${COMMON}/m5_mmap.c  $(OBJS) -no-pie
+SHM_ALLOC_DIR = ext/disagg-shmem-allocator
+SHM_ALLOC_INC = -I$(SHM_ALLOC_DIR)/include -D_POSIX_C_SOURCE=200809L
+SHM_ALLOC_OBJS = $(SHM_ALLOC_DIR)/build/shm_alloc.o $(SHM_ALLOC_DIR)/build/shm_ns.o
+SHM_ALLOC_LIBS = -pthread -lrt
+GRAPH_SHMEM_SRC = $(COMMON)/graph_shmem.cc
+
+$(SHM_ALLOC_OBJS): $(SHM_ALLOC_DIR)/Makefile
+	$(MAKE) -C $(SHM_ALLOC_DIR) build/shm_alloc.o build/shm_ns.o
+
+% : src/%.cc src/*.h $(OBJS) $(SHM_ALLOC_OBJS) $(GRAPH_SHMEM_SRC)
+	$(CXX) $(CXX_FLAGS) $(SHM_ALLOC_INC) $< $(GRAPH_SHMEM_SRC) -o $@ \
+		$(COMMON)/m5_mmap.c $(OBJS) $(SHM_ALLOC_OBJS) $(SHM_ALLOC_LIBS) -no-pie
 
 # Testing
 include test/test.mk

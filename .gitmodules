@@ -1,0 +1,3 @@
+[submodule "ext/disagg-shmem-allocator"]
+	path = ext/disagg-shmem-allocator
+	url = https://github.com/kaustav-goswami/disagg-shmem-allocator.git

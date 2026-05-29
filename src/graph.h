@@ -15,10 +15,7 @@
 #include "pvector.h"
 #include "util.h"
 
-// kg: adding a dmalloc header to enable disaggregated memory allocations.
-// note that this is NOT an allocator in the traditional sense. We need a map
-// of a memory, not an entire fully-fledged memory allocator.
-#include "dmalloc.h"
+#include "graph_shmem.h"
 
 #define INT64_T sizeof(int64_t)
 #define INT sizeof(int)
@@ -152,7 +149,8 @@ class CSRGraph {
  public:
   CSRGraph() : directed_(false), num_nodes_(-1), num_edges_(-1),
     out_index_(nullptr), out_neighbors_(nullptr),
-    in_index_(nullptr), in_neighbors_(nullptr) {}
+    in_index_(nullptr), in_neighbors_(nullptr),
+    _mmap_pointer(nullptr), _shm_attached(false) {}
 
   CSRGraph(int64_t num_nodes, DestID_** index, DestID_* neighs) :
     directed_(false), num_nodes_(num_nodes),
@@ -183,15 +181,14 @@ class CSRGraph {
       // goal: if this is the host then copy the contencts of the arrays to the
       // the mmapped backed memory and notify the user.
 
-      // otherwise, return the pointers to the right part of the memory back to
-      // the user as these might be clients. the pointer must be int*
-      // _mmap_pointer = hmalloc(1 << 30, host_id);
-      if (test_mode == 1) {
-        std::cout << "info: test mode! Will use shmem" << std::endl;
-        _mmap_pointer = shmalloc((size_t) size_of_shmem, host_id);
-      }
-      else
-        _mmap_pointer = dmalloc(size_of_shmem, host_id);
+      const int create_region = (host_id == 0) ? 1 : 0;
+      if (test_mode == 1)
+        std::cout << "info: test mode! Using POSIX shm_alloc backend" << std::endl;
+      graph_shmem_open(host_id, (size_t) size_of_shmem, test_mode, create_region);
+      const size_t layout_bytes = SharedLayoutBytes(
+          index_x, neigh_size, host_id == 0 ? *index : nullptr);
+      graph_shmem_graph_base(host_id, layout_bytes, &_mmap_pointer);
+      _shm_attached = true;
 
       // kg: if i am a worker node, then I need to wait for the synch variable
 
@@ -239,7 +236,7 @@ class CSRGraph {
         // The master needs to allocate and then populate the data.
         assign_data(_mmap_pointer, *index, index_x, *neighs, neigh_size);
         // the master has done everything, just clflush the cache!
-        flush_x86_cache(_mmap_pointer, size_of_shmem);
+        graph_shmem_flush_cache(_mmap_pointer, layout_bytes);
       }
       // update: We don't need to free these data structures in the allocator.
       // The allocator will do some algo as well.
@@ -292,18 +289,43 @@ class CSRGraph {
 
   CSRGraph(CSRGraph&& other) : directed_(other.directed_),
     num_nodes_(other.num_nodes_), num_edges_(other.num_edges_),
+    index_index_array(other.index_index_array),
     out_index_(other.out_index_), out_neighbors_(other.out_neighbors_),
-    in_index_(other.in_index_), in_neighbors_(other.in_neighbors_) {
+    in_index_(other.in_index_), in_neighbors_(other.in_neighbors_),
+    _mmap_pointer(other._mmap_pointer), _shm_attached(other._shm_attached),
+    _synch_var(other._synch_var), _num_nodes(other._num_nodes),
+    _index_x(other._index_x), _neigh_size(other._neigh_size) {
       other.num_edges_ = -1;
       other.num_nodes_ = -1;
       other.out_index_ = nullptr;
       other.out_neighbors_ = nullptr;
       other.in_index_ = nullptr;
       other.in_neighbors_ = nullptr;
+      other._mmap_pointer = nullptr;
+      other._shm_attached = false;
   }
 
   ~CSRGraph() {
     ReleaseResources();
+    if (_shm_attached) {
+      graph_shmem_close_region();
+      _shm_attached = false;
+      _mmap_pointer = nullptr;
+    }
+  }
+
+  static size_t SharedLayoutBytes(size_t index_x, size_t neigh_size,
+                                  DestID_** index) {
+    size_t sum_index = 0;
+    if (index != nullptr) {
+      for (size_t i = 0; i + 1 < index_x; i++)
+        sum_index += static_cast<size_t>(index[i + 1] - index[i]);
+    }
+    const size_t total_ints =
+        1 + INT64_T / INT + (2 * SIZE_T) / INT +
+        (neigh_size * DESTID_) / INT + (index_x * SIZE_T) / INT +
+        (sum_index * DESTID_) / INT;
+    return total_ints * INT;
   }
 
   // kg: defining new methods to manage the memory
@@ -344,13 +366,12 @@ class CSRGraph {
       size_t sum_local = 0;
       
       for (size_t i = 0 ; i < index_x ; i++) {
-
         out_index_[i] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT
             + (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT +
             (sum_local * DESTID_)/INT];
-        // finally set the in_index_ value
         in_index_[i] = out_index_[i];
-        sum_local += index_index_array[i];
+        if (i < index_x - 1)
+          sum_local += index_index_array[i];
       }
 
     }
@@ -391,15 +412,12 @@ class CSRGraph {
             << " memory! This may take some time..." << std::endl;
 
     for (size_t i = 0 ; i < index_x ; i++) {
-      // TODO
-      // can there be a node without any edges? for an undirected graph, NO
       out_index_[i] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT
           + (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT +
           (sum_local * DESTID_)/INT];
-      // finally set the in_index_ value
       in_index_[i] = out_index_[i];
-      // make sure that the local sum is updated for each loop.
-      sum_local += index_index_array[i];
+      if (i < index_x - 1)
+        sum_local += index_index_array[i];
     }
 
     // ready to write the memory!!!
@@ -544,11 +562,6 @@ class CSRGraph {
   }
 
  private:
-  int *_mmap_pointer;
-  int *_synch_var;
-  int64_t *_num_nodes;
-  size_t *_index_x;
-  size_t *_neigh_size;
   bool directed_;
   int64_t num_nodes_;
   int64_t num_edges_;
@@ -557,6 +570,12 @@ class CSRGraph {
   DestID_*  out_neighbors_;
   DestID_** in_index_;
   DestID_*  in_neighbors_;
+  int *_mmap_pointer = nullptr;
+  bool _shm_attached = false;
+  int *_synch_var = nullptr;
+  int64_t *_num_nodes;
+  size_t *_index_x;
+  size_t *_neigh_size;
 };
 
 #endif  // GRAPH_H_
