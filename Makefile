@@ -1,6 +1,21 @@
 # See LICENSE.txt for license details.
 
-CXX_FLAGS += -std=c++11 -O3 -Wall -DM5OP_ADDR=0xFFFF0000 -g
+SHM_ALLOC_DIR = disagg-shmem-allocator
+SHM_ALLOC_BUILD = $(SHM_ALLOC_DIR)/build
+SHM_ALLOC_OBJS = $(SHM_ALLOC_BUILD)/shm_alloc.o $(SHM_ALLOC_BUILD)/shm_ns.o \
+                 $(SHM_ALLOC_BUILD)/shm_cap.o
+SHM_ALLOC_INC = -I$(SHM_ALLOC_DIR)/include -I$(SHM_ALLOC_DIR)/src
+SHM_LDFLAGS = -pthread -lrt
+
+# Cache persist for DAX/CXL (optional): make CACHE=CLWB or CACHE=CBO_CLEAN
+CACHE ?=
+ifneq ($(CACHE),)
+  SHM_CACHE_FLAG = -DSHM_CACHE_$(CACHE)
+else
+  SHM_CACHE_FLAG =
+endif
+
+CXX_FLAGS += -std=c++11 -O3 -Wall -DM5OP_ADDR=0xFFFF0000 -g $(SHM_ALLOC_INC) $(SHM_CACHE_FLAG)
 PAR_FLAG = -fopenmp
 CC = gcc
 
@@ -43,8 +58,17 @@ ifeq (${HOOKS}, 1)
        CXX_FLAGS += -DHOOKS
 endif
 
-% : src/%.cc src/*.h $(OBJS)
-	$(CXX) $(CXX_FLAGS) $< -o $@ ${COMMON}/m5_mmap.c  $(OBJS) -no-pie
+$(SHM_ALLOC_BUILD)/shm_alloc.o:
+	$(MAKE) -C $(SHM_ALLOC_DIR) build/shm_alloc.o CACHE=$(CACHE)
+
+$(SHM_ALLOC_BUILD)/shm_ns.o:
+	$(MAKE) -C $(SHM_ALLOC_DIR) build/shm_ns.o CACHE=$(CACHE)
+
+$(SHM_ALLOC_BUILD)/shm_cap.o:
+	$(MAKE) -C $(SHM_ALLOC_DIR) build/shm_cap.o CACHE=$(CACHE)
+
+% : src/%.cc src/*.h $(OBJS) $(SHM_ALLOC_OBJS)
+	$(CXX) $(CXX_FLAGS) $< -o $@ ${COMMON}/m5_mmap.c $(OBJS) $(SHM_ALLOC_OBJS) $(SHM_LDFLAGS) -no-pie
 
 # Testing
 include test/test.mk
@@ -56,5 +80,5 @@ include benchmark/bench.mk
 .PHONY: clean
 clean:
 	rm -f $(SUITE) test/out/*
-	rm -f src/hooks.o
-	rm -r src/m5op_x86.o
+	rm -f src/hooks.o src/m5op_x86.o
+	$(MAKE) -C $(SHM_ALLOC_DIR) clean

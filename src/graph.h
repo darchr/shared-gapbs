@@ -15,15 +15,7 @@
 #include "pvector.h"
 #include "util.h"
 
-// kg: adding a dmalloc header to enable disaggregated memory allocations.
-// note that this is NOT an allocator in the traditional sense. We need a map
-// of a memory, not an entire fully-fledged memory allocator.
-#include "dmalloc.h"
-
-#define INT64_T sizeof(int64_t)
-#define INT sizeof(int)
-#define SIZE_T sizeof(size_t)
-#define DESTID_ sizeof(DestID_)
+#include "shm_graph.h"
 
 // There are four values, storing the metadata information of the graph!
 #define METADATA 4
@@ -170,112 +162,87 @@ class CSRGraph {
       // num_edges_ = (out_index_[num_nodes_] - out_index_[0]) / 2;
     }
 
-  // kg: we need our own CSRGraph constructor that uses the host_ids correctly.
-  // further, a method is required to validate whether the graph generated and
-  // read from the /dev is the same.
-  // TODO
   CSRGraph(int64_t num_nodes, DestID_*** index, size_t index_x,
         DestID_** neighs, size_t neigh_size, int host_id, int validate_graph,
         int size_of_shmem, int test_mode) :
-    directed_(false), num_nodes_(num_nodes) {
-      // kg: Make sure that the shared graph will be stored here and nothing
-      // else.
-      // goal: if this is the host then copy the contencts of the arrays to the
-      // the mmapped backed memory and notify the user.
+    host_id_(host_id), directed_(false), num_nodes_(num_nodes) {
+      gapbs_shm::OpenRegion(host_id, test_mode, static_cast<size_t>(size_of_shmem));
+      region_ = gapbs_shm::Region::Get().handle;
 
-      // otherwise, return the pointers to the right part of the memory back to
-      // the user as these might be clients. the pointer must be int*
-      // _mmap_pointer = hmalloc(1 << 30, host_id);
-      if (test_mode == 1) {
-        std::cout << "info: test mode! Will use shmem" << std::endl;
-        _mmap_pointer = shmalloc((size_t) size_of_shmem, host_id);
-      }
-      else
-        _mmap_pointer = dmalloc(size_of_shmem, host_id);
-
-      // kg: if i am a worker node, then I need to wait for the synch variable
-
-      // the start of the mmap array will be allocated to the start of index
-      _synch_var = (int *) &_mmap_pointer[0];
-      
       if (host_id == 0) {
-        // set the metadata of the graph. There are 3 more metadata values
-        // the number of nodes
-        _num_nodes = (int64_t *) &_mmap_pointer[1];
-        _num_nodes[0] = num_nodes;
-        // size of the index_x.
-        _index_x = (size_t *) &_mmap_pointer[1 + INT64_T/INT];
-        _index_x[0] = index_x;
-        // size of neighs
-        _neigh_size = (size_t *) &_mmap_pointer[1 + INT64_T/INT + SIZE_T/INT];
-        _neigh_size[0] = neigh_size;
+        size_t index_elems = 0;
+        for (size_t i = 0; i + 1 < index_x; i++)
+          index_elems += static_cast<size_t>((*index)[i + 1] - (*index)[i]);
+
+        uint64_t id = 0;
+        shm_off_t off = 0;
+        int rc = 0;
+
+        rc = gapbs_shm::AllocObject(region_, sizeof(GapbsSync), GAPBS_OBJ_SYNC,
+                                    &id, &off, &sync_cap_);
+        if (rc != 0) { std::cerr << "error: alloc sync failed\n"; std::exit(EXIT_FAILURE); }
+
+        rc = gapbs_shm::AllocObject(region_, sizeof(GapbsMeta), GAPBS_OBJ_META,
+                                    &id, &off, &meta_cap_);
+        if (rc != 0) { std::cerr << "error: alloc meta failed\n"; std::exit(EXIT_FAILURE); }
+
+        rc = gapbs_shm::AllocObject(region_, index_x * sizeof(size_t),
+                                    GAPBS_OBJ_ROW_LENS, &id, &off, &row_lens_cap_);
+        if (rc != 0) { std::cerr << "error: alloc row_lens failed\n"; std::exit(EXIT_FAILURE); }
+
+        rc = gapbs_shm::AllocObject(region_, neigh_size * sizeof(DestID_),
+                                    GAPBS_OBJ_NEIGHS, &id, &off, &neighs_cap_);
+        if (rc != 0) { std::cerr << "error: alloc neighs failed\n"; std::exit(EXIT_FAILURE); }
+
+        rc = gapbs_shm::AllocObject(region_, index_elems * sizeof(DestID_),
+                                    GAPBS_OBJ_INDEX, &id, &off, &index_cap_);
+        if (rc != 0) { std::cerr << "error: alloc index failed\n"; std::exit(EXIT_FAILURE); }
+
+        GapbsSync *sync = shm_cap_deref_as(region_, sync_cap_, GapbsSync,
+                                           gapbs_shm::RwRequired());
+        GapbsMeta *meta = shm_cap_deref_as(region_, meta_cap_, GapbsMeta,
+                                           gapbs_shm::RwRequired());
+        sync->ready = 0;
+        gapbs_shm::PersistRange(sync, sizeof(GapbsSync));
+
+        meta->num_nodes = num_nodes;
+        meta->index_x = index_x;
+        meta->neigh_size = neigh_size;
+        gapbs_shm::PersistRange(meta, sizeof(GapbsMeta));
+      } else {
+        gapbs_shm::GraphCaps caps = gapbs_shm::OpenGraphCaps(host_id);
+        sync_cap_ = caps.sync;
+        meta_cap_ = caps.meta;
+        row_lens_cap_ = caps.row_lens;
+        neighs_cap_ = caps.neighs;
+        index_cap_ = caps.index;
+
+        const GapbsMeta *meta = shm_cap_deref_as(region_, meta_cap_, GapbsMeta,
+                                                 gapbs_shm::RoRequired());
+        num_nodes = num_nodes_ = meta->num_nodes;
+        index_x = meta->index_x;
+        neigh_size = meta->neigh_size;
       }
-      // kg: if i am a worker, then I pool on the synch. variable until it is
-      // set to 1.
+
+      assign_sizes(index_x, neigh_size, host_id);
+
+      if (host_id == 0)
+        assign_data(*index, index_x, *neighs, neigh_size);
       else {
-        std::cout << "info: waiting for master!" << std::endl;
-        while (_synch_var[0] != 1) {}
-        std::cout << "info: master has set the variable!" << std::endl;
-        std::cout << "info: reading graph metadata!" << std::endl;
-        _num_nodes = (int64_t *) &_mmap_pointer[1];
-        // num_nodes is a function argument but num_nodes_ was set when the
-        // contructor was called for the first time. The worker nodes does not
-        // know anything about it!
-        num_nodes = num_nodes_ = _num_nodes[0];
-        // size of the index_x.
-        _index_x = (size_t *) &_mmap_pointer[1 + INT64_T/INT];
-        index_x = _index_x[0];
-        // size of neighs
-        _neigh_size = (size_t *) &_mmap_pointer[1 + INT64_T/INT + SIZE_T/INT];
-        neigh_size = _neigh_size[0];
-
-        // I'm ready!!
-      }
-      
-      // need to assign size and data
-      assign_sizes(_mmap_pointer, index_x, neigh_size, host_id);
-      
-      if (host_id == 0) {
-        // The master needs to allocate and then populate the data.
-        assign_data(_mmap_pointer, *index, index_x, *neighs, neigh_size);
-        // the master has done everything, just clflush the cache!
-        flush_x86_cache(_mmap_pointer, size_of_shmem);
-      }
-      // update: We don't need to free these data structures in the allocator.
-      // The allocator will do some algo as well.
-
-      // kg: once the data is assigned to the mmap space, we can freeup the
-      // arrays that the program uses. Ideally this is correct but I'm just
-      // lazy to free index and neigh and re-read them from the shared memory
-      // for the allocator node. So I'd assume that THIS IS INCORRECT!!
-
-      // update: In case this is a worker node, it'll read the index and the
-      // neighs from the mmap and then allocate the correct data into these
-      // variables. ** This is not the right place **
-      else {
-
-        // Now read the index and the neighs from the pointer. This needs
-        // to work for the host and also for the workers as well. index and
-        // neighs are both free pointers right now. Just reassign them from the
-        // mmaped region
         index = &out_index_;
         neighs = &out_neighbors_;
       }
 
-      std::cout << "info: value at synch. location = " << _mmap_pointer[0]
-                                                                  << std::endl;
+      GapbsSync *sync = shm_cap_deref_as(region_, sync_cap_, GapbsSync,
+                                         host_id == 0 ? gapbs_shm::RwRequired()
+                                                      : gapbs_shm::RoRequired());
+      std::cout << "info: graph ready flag = " << sync->ready << std::endl;
 
-      // validation is done already by dumping the data into separate files.
-      // I'm putting this on a low priority to do item.
-      if (validate_graph == true) {
-        // TODO
-        std::cout << "fatal: NotImplementedError: Validation is pending!" <<
-            std::endl;
-        exit(-1);
-
+      if (validate_graph) {
+        std::cout << "fatal: NotImplementedError: Validation is pending!\n";
+        std::exit(EXIT_FAILURE);
       }
       num_edges_ = (out_index_[num_nodes_] - out_index_[0]) / 2;
-
     }
 
   // kg: we need our own CSRGraph constructor that uses the host_ids correctly.
@@ -307,120 +274,73 @@ class CSRGraph {
   }
 
   // kg: defining new methods to manage the memory
-  void assign_sizes(int *_mmap, size_t index_x, size_t neigh_size, int host_id) {
-    // need to assign 2d pointers. regardless of the host_id, this step is true
-    // for all hosts.
+  void assign_sizes(size_t index_x, size_t neigh_size, int host_id) {
+    const shm_perm_t required = (host_id == 0) ? gapbs_shm::RwRequired()
+                                               : gapbs_shm::RoRequired();
 
-    // see the figure in the README to understand this mapping.
-    out_neighbors_ = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT];
+    out_neighbors_ = shm_cap_deref_as(region_, neighs_cap_, DestID_, required);
     in_neighbors_ = out_neighbors_;
 
-    // next we need to keep a track of all the y indices
-    index_index_array = (size_t *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT +
-                                                   (neigh_size * DESTID_)/INT];
+    index_index_array = shm_cap_deref_as(region_, row_lens_cap_, size_t, required);
 
+    DestID_ *index_base = shm_cap_deref_as(region_, index_cap_, DestID_, required);
 
-    // This is a 2d array. we need a holder for the pointer pointer
-    out_index_ = (DestID_ **) malloc (index_x * sizeof(DestID_ *));
-    in_index_ = (DestID_ **) malloc (index_x * sizeof(DestID_ *));
+    out_index_ = static_cast<DestID_ **>(malloc(index_x * sizeof(DestID_ *)));
+    in_index_ = static_cast<DestID_ **>(malloc(index_x * sizeof(DestID_ *)));
 
-    // If i am the host, IDK the size of each row for the index array. We'll
-    // only know that once the data is allocated!
     if (host_id > 0) {
-      // workers always have the sizes!
-      //
-      // now that i have the sizes, i can reassign them. remember the first
-      // element will start at the base i.e. +0!
-      out_index_[0] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT +
-                          (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT];
-      // the in_index_ is the same for these graphs! I'm doing another line for
-      // this step for better understanding.
-      in_index_[0] = out_index_[0];
+      out_index_[0] = index_base;
+      in_index_[0] = index_base;
 
-
-      // WE ONLY CARE ABOUT INDEX_X - 1 i.e. NUM_NODES rows!
-      // A new variable local_sum is needed to figure out the length of each
-      // row
       size_t sum_local = 0;
-      
-      for (size_t i = 0 ; i < index_x ; i++) {
-
-        out_index_[i] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT
-            + (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT +
-            (sum_local * DESTID_)/INT];
-        // finally set the in_index_ value
+      for (size_t i = 0; i < index_x; i++) {
+        out_index_[i] = index_base + sum_local;
         in_index_[i] = out_index_[i];
         sum_local += index_index_array[i];
       }
-
     }
-
   }
 
-  void assign_data(int *_mmap, DestID_** index, size_t index_x,
-                                          DestID_ *neighs, size_t neigh_size) {
-    // once every sinvle variable size is set, we only need to assign the data
-    // only the master calls this function
-    
-    // kg: the problem here is that each row of the index array is of variable
-    // size. The client/worker has no way of knoing this unless this
-    // information is stored in the shared memory.
-
-    // The index_index_array needs to store the number of elements each
-    // row has, i.e. elements_in_row_i
-    // This can be calculated by subtrating the base of the i th row
-    // from i + 1 th row.
-    // The final index is not necessary as there are index_x - 1 number
-    // of nodes.
+  void assign_data(DestID_** index, size_t index_x,
+                   DestID_ *neighs, size_t neigh_size) {
     #pragma omp parallel for
-    for (size_t i = 0 ; i < index_x - 1; i++)
-      index_index_array[i] = (index[i + 1] - index[i]);
-    
-    // now that i have the sizes, i can reassign them. remember the first elem-
-    // ent will start at the base i.e. +0!
-    out_index_[0] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT
-                        + (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT];
-    // the in_index_ is the same for these graphs! I'm doing another line for
-    // this step for better understanding.
-    in_index_[0] = out_index_[0];
+    for (size_t i = 0; i < index_x - 1; i++)
+      index_index_array[i] = static_cast<size_t>(index[i + 1] - index[i]);
+    gapbs_shm::PersistRange(index_index_array,
+                            (index_x > 0 ? index_x - 1 : 0) * sizeof(size_t));
 
-    // WE ONLY CARE ABOUT INDEX_X - 1 i.e. NUM_NODES rows!
-    // A new variable local_sum is needed to figure out the length of each row
+    DestID_ *index_base = shm_cap_deref_as(region_, index_cap_, DestID_,
+                                           gapbs_shm::RwRequired());
+    out_index_[0] = index_base;
+    in_index_[0] = index_base;
+
     size_t sum_local = 0;
-    std::cout << "info: the allocator is writing the index array to the shared"
-            << " memory! This may take some time..." << std::endl;
+    std::cout << "info: writing graph index into shared memory...\n";
 
-    for (size_t i = 0 ; i < index_x ; i++) {
-      // TODO
-      // can there be a node without any edges? for an undirected graph, NO
-      out_index_[i] = (DestID_ *) &_mmap[1 + INT64_T/INT + (2 * SIZE_T)/INT
-          + (neigh_size * DESTID_)/INT + (index_x * SIZE_T)/INT +
-          (sum_local * DESTID_)/INT];
-      // finally set the in_index_ value
+    for (size_t i = 0; i < index_x; i++) {
+      out_index_[i] = index_base + sum_local;
       in_index_[i] = out_index_[i];
-      // make sure that the local sum is updated for each loop.
       sum_local += index_index_array[i];
     }
 
-    // ready to write the memory!!!
     #pragma omp parallel for
-    for (size_t i = 0 ; i < index_x - 1; i++) {
-
+    for (size_t i = 0; i < index_x - 1; i++) {
       for (size_t j = 0; j < index_index_array[i]; j++)
         out_index_[i][j] = index[i][j];
-      
-      // making absolutely sure at this point.
       in_index_[i] = out_index_[i];
     }
+    gapbs_shm::PersistRange(index_base, sum_local * sizeof(DestID_));
 
-    // this is the simple step of writing an one-dimensional array
-    for (size_t i = 0 ; i < neigh_size ; i++) {
+    for (size_t i = 0; i < neigh_size; i++) {
       out_neighbors_[i] = neighs[i];
       in_neighbors_[i] = neighs[i];
     }
+    gapbs_shm::PersistRange(out_neighbors_, neigh_size * sizeof(DestID_));
 
-    // make sure that the synchronization variable is finally set
-    _synch_var[0] = 1;
+    GapbsSync *sync = shm_cap_deref_as(region_, sync_cap_, GapbsSync,
+                                       gapbs_shm::RwRequired());
+    sync->ready = 1;
+    gapbs_shm::PersistRange(sync, sizeof(GapbsSync));
   }
 
   void print_data(size_t index_x) {
@@ -434,7 +354,8 @@ class CSRGraph {
       }
       std::cout << std::endl;
     }
-    std::cout << INT << " " << DESTID_ << " " << SIZE_T << std::endl;
+    std::cout << sizeof(int) << " " << sizeof(DestID_) << " " << sizeof(size_t)
+              << std::endl;
   }
 
   void print_neighs(size_t neigh_size) {
@@ -544,11 +465,13 @@ class CSRGraph {
   }
 
  private:
-  int *_mmap_pointer;
-  int *_synch_var;
-  int64_t *_num_nodes;
-  size_t *_index_x;
-  size_t *_neigh_size;
+  shm_region_t *region_;
+  shm_cap_t sync_cap_;
+  shm_cap_t meta_cap_;
+  shm_cap_t row_lens_cap_;
+  shm_cap_t neighs_cap_;
+  shm_cap_t index_cap_;
+  int host_id_;
   bool directed_;
   int64_t num_nodes_;
   int64_t num_edges_;

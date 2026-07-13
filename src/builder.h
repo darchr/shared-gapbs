@@ -51,19 +51,9 @@ class BuilderBase {
 
   // kg: in this updated version of the shared gapbs, we maintain the allocator
   // object in builder class rather than in the graph class.
-  // _______________________________________________________________ .. ______
-  // | synch_var (0) | **index | *neighs                                      |
-  // |_______________|_________|____________________________________ .. ______|
-  int *_mmap_pointer;
-  // kg: a synchronization variable is needed to make sure that the allocation
-  // is finished.
-  int *_synch_var;    // size = 1 x sizeof(int)
-
- public:
-  // kg: Need a couple of more variables to maintain the size of the index and
-  // neighs. The x dimension is _x and y is _y for all these extra variables.
   size_t index_x, index_y, neighs_x;
 
+ public:
   explicit BuilderBase(const CLBase &cli) : cli_(cli) {
     // kg: Set the size variables to -1 so that we can distinguish them later.
     index_x = SIZE_MAX;
